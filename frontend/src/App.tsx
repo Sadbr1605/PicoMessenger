@@ -1,317 +1,302 @@
-import React, { useState, useEffect, useRef, useCallback } from 'react';
-import { Send, LogOut, Wifi, WifiOff, Smartphone, Loader2, MessageSquare, AlertCircle } from 'lucide-react';
-import { Message, Credentials } from './types';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Loader2, LogOut, Send, Smartphone, Wifi } from "lucide-react";
+import type { Credentials, Message, PollResponse } from "./types";
 
-// Configuração de API via variável de ambiente do Vite
-// @ts-ignore
-const API_BASE = import.meta.env.VITE_API_BASE_URL || '';
-const API_URL = `${API_BASE}/api`;
+const API_URL = import.meta.env.VITE_API_URL ?? "";
 
-function App() {
+function clampText(s: string, max = 280) {
+  const t = s.replace(/\r\n/g, "\n");
+  return t.length > max ? t.slice(0, max) : t;
+}
+
+export default function App() {
   const [creds, setCreds] = useState<Credentials | null>(() => {
-    const saved = localStorage.getItem('pico_creds');
-    return saved ? JSON.parse(saved) : null;
+    const raw = localStorage.getItem("pico_creds");
+    try {
+      return raw ? (JSON.parse(raw) as Credentials) : null;
+    } catch {
+      return null;
+    }
   });
 
   const [messages, setMessages] = useState<Message[]>([]);
-  const [latestId, setLatestId] = useState(0);
-  const [inputText, setInputText] = useState('');
-  const [isSending, setIsSending] = useState(false);
-  const [isOnline, setIsOnline] = useState(true);
-  const [error, setError] = useState<string | null>(null);
-  
-  const scrollRef = useRef<HTMLDivElement>(null);
+  const [latestId, setLatestId] = useState<number>(0);
 
-  // Monitorar status da rede do navegador
-  useEffect(() => {
-    const handleOnline = () => setIsOnline(true);
-    const handleOffline = () => setIsOnline(false);
-    window.addEventListener('online', handleOnline);
-    window.addEventListener('offline', handleOffline);
-    return () => {
-      window.removeEventListener('online', handleOnline);
-      window.removeEventListener('offline', handleOffline);
-    };
+  const [threadId, setThreadId] = useState("");
+  const [pairCode, setPairCode] = useState("");
+
+  const [input, setInput] = useState("");
+  const [sending, setSending] = useState(false);
+
+  const [status, setStatus] = useState<"offline" | "connecting" | "online">(
+    creds ? "connecting" : "offline"
+  );
+  const [error, setError] = useState<string>("");
+
+  const endRef = useRef<HTMLDivElement | null>(null);
+
+  const canUseApi = useMemo(() => {
+    // Se API_URL estiver vazio, o front tenta mesma origem (útil se você proxyar depois).
+    // Para Cloud Functions, normalmente você vai setar VITE_API_URL com https://.../api
+    return true;
   }, []);
 
-  // Login/Pareamento
-  const handleLogin = (e: React.FormEvent) => {
-    e.preventDefault();
-    const formData = new FormData(e.target as HTMLFormElement);
-    const thread_id = (formData.get('thread_id') as string).trim();
-    const pair_code = (formData.get('pair_code') as string).trim();
+  const logout = useCallback(() => {
+    setCreds(null);
+    localStorage.removeItem("pico_creds");
+    setMessages([]);
+    setLatestId(0);
+    setStatus("offline");
+    setError("");
+  }, []);
 
-    if (thread_id && pair_code) {
-      const newCreds = { thread_id, pair_code };
-      setCreds(newCreds);
-      localStorage.setItem('pico_creds', JSON.stringify(newCreds));
-      setError(null);
-      setMessages([]);
-      setLatestId(0);
-    }
-  };
-
-  const logout = () => {
-    if (confirm("Deseja desconectar deste dispositivo?")) {
-      setCreds(null);
-      localStorage.removeItem('pico_creds');
-      setMessages([]);
-      setLatestId(0);
-    }
-  };
-
-  // Lógica de Busca de Mensagens (Pull)
   const fetchMessages = useCallback(async () => {
-    if (!creds || !isOnline) return;
+    if (!creds) return;
+    if (!canUseApi) return;
+
+    setStatus((s) => (s === "online" ? "online" : "connecting"));
+
+    const params = new URLSearchParams({
+      thread_id: creds.thread_id,
+      pair_code: creds.pair_code,
+      after: String(latestId),
+    });
 
     try {
-      const params = new URLSearchParams({
-        thread_id: creds.thread_id,
-        pair_code: creds.pair_code,
-        after: latestId.toString()
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 8000);
+
+      const res = await fetch(`${API_URL}/web_pull?${params.toString()}`, {
+        method: "GET",
+        signal: controller.signal,
       });
 
-      const response = await fetch(`${API_URL}/web_pull?${params}`);
-      
-      if (response.status === 403) {
-        setCreds(null);
-        localStorage.removeItem('pico_creds');
-        setError("Código de pareamento inválido ou expirado.");
+      clearTimeout(timeout);
+
+      if (res.status === 403) {
+        setError("Pareamento inválido. Confira o thread_id e o pair_code.");
+        logout();
         return;
       }
 
-      if (!response.ok) throw new Error("Erro ao buscar mensagens");
-
-      const data = await response.json();
-      
-      if (data.msgs && data.msgs.length > 0) {
-        setMessages(prev => {
-          // Evita duplicatas comparando IDs
-          const existingIds = new Set(prev.map(m => m.msg_id));
-          const filteredNew = data.msgs.filter((m: Message) => !existingIds.has(m.msg_id));
-          return [...prev, ...filteredNew].sort((a, b) => a.msg_id - b.msg_id);
-        });
-        setLatestId(data.latest);
+      if (!res.ok) {
+        throw new Error(`HTTP ${res.status}`);
       }
-      setError(null);
-    } catch (err) {
-      console.error("Polling error:", err);
-      // Não mostramos erro gritante no polling para não estragar a UX, 
-      // apenas se persistir ou falhar no envio.
-    }
-  }, [creds, latestId, isOnline]);
 
-  // Efeito de Polling (2 segundos)
+      const data = (await res.json()) as PollResponse;
+
+      if (Array.isArray(data.msgs) && data.msgs.length > 0) {
+        setMessages((prev) => {
+          const seen = new Set(prev.map((m) => m.msg_id));
+          const merged = [...prev];
+          for (const m of data.msgs) {
+            if (!seen.has(m.msg_id)) merged.push(m);
+          }
+          merged.sort((a, b) => a.msg_id - b.msg_id);
+          return merged;
+        });
+      }
+      if (typeof data.latest === "number") setLatestId(data.latest);
+
+      setStatus("online");
+    } catch {
+      setStatus("offline");
+      // não spammar erro no UI a cada poll; só mantém offline
+    }
+  }, [API_URL, canUseApi, creds, latestId, logout]);
+
   useEffect(() => {
     if (!creds) return;
-    
-    fetchMessages(); // Primeira carga
-    const interval = setInterval(fetchMessages, 2000);
-    
-    return () => clearInterval(interval);
+    setError("");
+    setStatus("connecting");
+
+    fetchMessages();
+    const id = setInterval(fetchMessages, 2000);
+
+    return () => clearInterval(id);
   }, [creds, fetchMessages]);
 
-  // Auto-scroll para baixo
   useEffect(() => {
-    if (scrollRef.current) {
-      scrollRef.current.scrollTo({
-        top: scrollRef.current.scrollHeight,
-        behavior: 'smooth'
-      });
-    }
+    endRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages]);
 
-  // Envio de Mensagem
-  const handleSendMessage = async (e: React.FormEvent) => {
+  const handleLogin = (e: React.FormEvent) => {
     e.preventDefault();
-    if (!inputText.trim() || !creds || isSending || !isOnline) return;
+    const t = threadId.trim();
+    const p = pairCode.trim();
+    if (!t || !p) {
+      setError("Preencha thread_id e pair_code.");
+      return;
+    }
+    const next: Credentials = { thread_id: t, pair_code: p };
+    setCreds(next);
+    localStorage.setItem("pico_creds", JSON.stringify(next));
+    setMessages([]);
+    setLatestId(0);
+    setStatus("connecting");
+    setError("");
+  };
 
-    setIsSending(true);
-    setError(null);
+  const handleSend = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!creds || sending) return;
+
+    const text = clampText(input.trim(), 280);
+    if (!text) return;
+
+    setSending(true);
+    setError("");
 
     try {
-      const response = await fetch(`${API_URL}/web_send`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+      const res = await fetch(`${API_URL}/web_send`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           thread_id: creds.thread_id,
           pair_code: creds.pair_code,
-          text: inputText.trim()
-        })
+          text,
+        }),
       });
 
-      if (!response.ok) {
-        const data = await response.json();
-        throw new Error(data.detail || "Falha ao enviar");
+      if (res.status === 403) {
+        setError("Pareamento inválido. Confira o thread_id e o pair_code.");
+        logout();
+        return;
       }
 
-      setInputText('');
-      fetchMessages(); // Pull imediato para atualizar a lista
-    } catch (err: any) {
-      setError(err.message || "Erro de conexão ao enviar.");
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+
+      setInput("");
+      fetchMessages();
+    } catch {
+      setError("Falha ao enviar. Verifique a API e tente novamente.");
     } finally {
-      setIsSending(false);
+      setSending(false);
     }
   };
 
-  // --- RENDER: TELA DE PAREAMENTO ---
   if (!creds) {
     return (
-      <div className="min-h-screen flex items-center justify-center p-6 bg-slate-100">
-        <div className="bg-white w-full max-w-sm rounded-3xl shadow-xl p-8 border border-slate-200">
-          <div className="flex flex-col items-center mb-8">
-            <div className="bg-blue-600 p-4 rounded-2xl shadow-lg shadow-blue-200 mb-4">
-              <Smartphone size={32} className="text-white" />
-            </div>
-            <h1 className="text-2xl font-bold text-slate-800">PicoMessenger</h1>
-            <p className="text-slate-500 text-center text-sm mt-2">
-              Conecte-se à sua placa BitDogLab usando as informações da tela OLED.
-            </p>
+      <div className="page">
+        <div className="card">
+          <div className="titleRow">
+            <Smartphone size={20} />
+            <h1>PicoMessenger</h1>
           </div>
+          <p className="muted">
+            Digite o <b>thread_id</b> e o <b>pair_code</b> mostrados no OLED da BitDogLab.
+          </p>
 
-          {error && (
-            <div className="bg-red-50 text-red-600 p-3 rounded-xl mb-6 text-sm flex items-start gap-2 border border-red-100 animate-bubble">
-              <AlertCircle size={18} className="shrink-0 mt-0.5" />
-              <span>{error}</span>
+          {!API_URL && (
+            <div className="warn">
+              VITE_API_URL não está definido. Configure na Vercel (ex.: https://us-central1-SEU_PROJ.cloudfunctions.net/api).
             </div>
           )}
 
-          <form onSubmit={handleLogin} className="space-y-4">
-            <div className="space-y-1">
-              <label className="text-xs font-semibold text-slate-500 uppercase ml-1">Thread ID</label>
-              <input 
-                name="thread_id" 
-                required 
-                placeholder="Ex: a1b2c3d4"
-                className="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-xl focus:ring-2 focus:ring-blue-500 focus:bg-white transition-all outline-none text-slate-700"
+          {error && <div className="error">{error}</div>}
+
+          <form onSubmit={handleLogin} className="form">
+            <label>
+              Thread ID
+              <input
+                value={threadId}
+                onChange={(e) => setThreadId(e.target.value)}
+                placeholder="ex.: abcd1234"
+                autoComplete="off"
               />
-            </div>
-            <div className="space-y-1">
-              <label className="text-xs font-semibold text-slate-500 uppercase ml-1">Código de Pareamento</label>
-              <input 
-                name="pair_code" 
-                required 
-                placeholder="6 dígitos"
-                maxLength={6}
-                className="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-xl focus:ring-2 focus:ring-blue-500 focus:bg-white transition-all outline-none text-slate-700 font-mono tracking-widest text-center"
+            </label>
+            <label>
+              Pair Code
+              <input
+                value={pairCode}
+                onChange={(e) => setPairCode(e.target.value)}
+                placeholder="ex.: 123456"
+                inputMode="numeric"
+                autoComplete="off"
               />
-            </div>
-            <button className="w-full bg-blue-600 hover:bg-blue-700 text-white font-bold py-4 rounded-xl shadow-lg shadow-blue-100 transition-all active:scale-[0.98]">
-              Conectar Dispositivo
+            </label>
+
+            <button className="btn primary" type="submit">
+              Conectar
             </button>
           </form>
-          
-          <p className="text-center text-[10px] text-slate-400 mt-8 uppercase tracking-widest">
-            BitDogLab v7 • MicroPython
-          </p>
+        </div>
+
+        <div className="footerNote">
+          API atual: <code>{API_URL || "(mesma origem)"}</code>
         </div>
       </div>
     );
   }
 
-  // --- RENDER: TELA DE CHAT ---
   return (
-    <div className="flex flex-col h-[100dvh] max-w-md mx-auto bg-white shadow-2xl relative">
-      {/* Header */}
-      <header className="shrink-0 bg-white border-b border-slate-100 px-6 py-4 flex justify-between items-center z-20 shadow-sm">
-        <div className="flex items-center gap-3">
-          <div className="relative">
-            <div className={`w-3 h-3 rounded-full ${isOnline ? 'bg-green-500' : 'bg-slate-300'} ring-4 ring-white`}></div>
-            {isOnline && <div className="absolute inset-0 w-3 h-3 rounded-full bg-green-500 animate-ping opacity-75"></div>}
-          </div>
-          <div>
-            <h2 className="font-bold text-slate-800 text-sm leading-tight">BitDogLab</h2>
-            <p className="text-[10px] text-slate-400 font-mono uppercase tracking-tighter">ID: {creds.thread_id}</p>
-          </div>
-        </div>
-        <div className="flex items-center gap-2">
-          {!isOnline && <WifiOff size={16} className="text-red-400" />}
-          <button 
-            onClick={logout}
-            className="p-2 text-slate-400 hover:text-red-500 hover:bg-red-50 rounded-full transition-colors"
-            title="Sair"
-          >
-            <LogOut size={18} />
-          </button>
-        </div>
-      </header>
-
-      {/* Mensagens */}
-      <main 
-        ref={scrollRef}
-        className="flex-1 overflow-y-auto p-6 space-y-4 bg-slate-50/50 no-scrollbar"
-      >
-        {messages.length === 0 ? (
-          <div className="h-full flex flex-col items-center justify-center opacity-30 text-slate-500 select-none">
-            <MessageSquare size={48} className="mb-4" />
-            <p className="font-medium">Nenhuma mensagem ainda</p>
-            <p className="text-sm">Inicie a conversa com seu dispositivo.</p>
-          </div>
-        ) : (
-          messages.map((msg) => {
-            const isWeb = msg.from === 'web';
-            return (
-              <div 
-                key={`${msg.msg_id}-${msg.ts}`} 
-                className={`flex w-full animate-bubble ${isWeb ? 'justify-end' : 'justify-start'}`}
-              >
-                <div 
-                  className={`max-w-[85%] px-4 py-2.5 rounded-2xl text-sm shadow-sm ${
-                    isWeb 
-                      ? 'bg-blue-600 text-white rounded-tr-none' 
-                      : 'bg-white text-slate-700 border border-slate-100 rounded-tl-none'
-                  }`}
-                >
-                  <p className="leading-relaxed break-words">{msg.text}</p>
-                  <div className={`text-[10px] mt-1 text-right opacity-60 flex justify-end items-center gap-1`}>
-                    {new Date(msg.ts).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
-                    {isWeb && <span className="text-[8px]">✓</span>}
-                  </div>
-                </div>
-              </div>
-            );
-          })
-        )}
-      </main>
-
-      {/* Input de Mensagem */}
-      <footer className="shrink-0 p-4 bg-white border-t border-slate-100 shadow-[0_-4px_12px_rgba(0,0,0,0.02)]">
-        {error && (
-          <div className="text-[10px] text-red-500 mb-2 px-2 animate-bubble flex items-center gap-1">
-            <AlertCircle size={10} /> {error}
-          </div>
-        )}
-        <form onSubmit={handleSendMessage} className="flex items-end gap-2">
-          <div className="flex-1 relative">
-            <textarea
-              value={inputText}
-              onChange={(e) => setInputText(e.target.value)}
-              placeholder="Digite uma mensagem..."
-              rows={1}
-              maxLength={280}
-              onKeyDown={(e) => {
-                if (e.key === 'Enter' && !e.shiftKey) {
-                  e.preventDefault();
-                  handleSendMessage(e);
-                }
-              }}
-              className="w-full bg-slate-100 focus:bg-white text-slate-700 rounded-2xl px-4 py-3 pr-12 focus:outline-none focus:ring-2 focus:ring-blue-500/50 transition-all border border-transparent resize-none block text-sm"
-            />
-            <div className={`absolute right-3 bottom-3 text-[9px] font-bold tracking-tighter ${inputText.length > 250 ? 'text-orange-500' : 'text-slate-400'}`}>
-              {inputText.length}/280
+    <div className="page">
+      <div className="chatCard">
+        <div className="chatHeader">
+          <div className="chatHeaderLeft">
+            <div className="pill">
+              <Smartphone size={16} />
+              <span className="mono">{creds.thread_id}</span>
+            </div>
+            <div className={`status ${status}`}>
+              <Wifi size={16} />
+              <span>
+                {status === "online" ? "online" : status === "connecting" ? "conectando" : "offline"}
+              </span>
             </div>
           </div>
-          <button 
-            type="submit"
-            disabled={!inputText.trim() || isSending || !isOnline}
-            className="bg-blue-600 text-white p-3.5 rounded-2xl hover:bg-blue-700 disabled:opacity-30 disabled:grayscale transition-all shadow-lg shadow-blue-200 active:scale-95 shrink-0"
-          >
-            {isSending ? <Loader2 size={20} className="animate-spin" /> : <Send size={20} />}
+
+          <button className="btn ghost" onClick={logout} title="Sair">
+            <LogOut size={16} /> Sair
+          </button>
+        </div>
+
+        {error && <div className="error">{error}</div>}
+
+        <div className="chatBody">
+          {messages.length === 0 ? (
+            <div className="empty">
+              <div className="emptyTitle">Sem mensagens ainda</div>
+              <div className="muted">Envie uma mensagem para começar.</div>
+            </div>
+          ) : (
+            messages.map((m) => {
+              const mine = m.from === "web";
+              return (
+                <div key={m.msg_id} className={`msgRow ${mine ? "mine" : "theirs"}`}>
+                  <div className={`msgBubble ${mine ? "mine" : "theirs"}`}>
+                    <div className="msgText">{m.text}</div>
+                    <div className="msgMeta">
+                      <span className="mono">#{m.msg_id}</span>
+                      <span>
+                        {new Date(m.ts).toLocaleTimeString([], {
+                          hour: "2-digit",
+                          minute: "2-digit",
+                        })}
+                      </span>
+                    </div>
+                  </div>
+                </div>
+              );
+            })
+          )}
+          <div ref={endRef} />
+        </div>
+
+        <form className="chatInput" onSubmit={handleSend}>
+          <input
+            value={input}
+            onChange={(e) => setInput(clampText(e.target.value, 280))}
+            placeholder="Digite uma mensagem…"
+            maxLength={280}
+          />
+          <div className="counter">{input.length}/280</div>
+          <button className="btn primary" type="submit" disabled={sending || !input.trim()}>
+            {sending ? <Loader2 className="spin" size={16} /> : <Send size={16} />}
+            Enviar
           </button>
         </form>
-      </footer>
+      </div>
     </div>
   );
 }
-
-export default App;
