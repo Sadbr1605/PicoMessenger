@@ -1,0 +1,160 @@
+openapi: 3.0.0
+info:
+  title: PicoMessenger API
+  version: 1.0.0
+  description: Minimalist API for Microcontroller <-> Web Messaging
+servers:
+  - url: https://us-central1-YOUR_PROJECT_ID.cloudfunctions.net/api
+paths:
+  /register:
+    post:
+      summary: Register a device
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                device_id:
+                  type: string
+                name:
+                  type: string
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  thread_id:
+                    type: string
+                  token:
+                    type: string
+                  poll_interval_ms:
+                    type: integer
+                  pair_code:
+                    type: string
+
+  /send:
+    post:
+      summary: Send message from Device
+      security:
+        - bearerAuth: []
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                text:
+                  type: string
+                  maxLength: 280
+      responses:
+        '200':
+          description: Message accepted
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  msg_id:
+                    type: integer
+                  server_ts:
+                    type: integer
+
+  /pull:
+    get:
+      summary: Poll for messages (Device)
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: query
+          name: after
+          schema:
+            type: integer
+          description: Last received msg_id
+      responses:
+        '200':
+          description: List of messages
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  latest:
+                    type: integer
+                  msgs:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        msg_id:
+                          type: integer
+                        from:
+                          type: string
+                        text:
+                          type: string
+                        ts:
+                          type: integer
+
+  /web_send:
+    post:
+      summary: Send message from Web PWA
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - thread_id
+                - pair_code
+                - text
+              properties:
+                thread_id:
+                  type: string
+                pair_code:
+                  type: string
+                text:
+                  type: string
+      responses:
+        '200':
+          description: Sent
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  msg_id:
+                    type: integer
+
+  /web_pull:
+    get:
+      summary: Poll messages from Web PWA
+      parameters:
+        - in: query
+          name: thread_id
+          schema:
+             type: string
+          required: true
+        - in: query
+          name: pair_code
+          schema:
+             type: string
+          required: true
+        - in: query
+          name: after
+          schema:
+             type: integer
+      responses:
+        '200':
+          description: Messages
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer

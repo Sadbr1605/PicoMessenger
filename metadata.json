@@ -1,0 +1,5 @@
+{
+  "name": "PicoMessenger",
+  "description": "A lightweight messaging system designed for Raspberry Pi Pico W communication with a web PWA using Firebase and Cloud Functions.",
+  "requestFramePermissions": []
+}
